@@ -1,0 +1,8 @@
+requests
+beautifulsoup4
+openpyxl
+python-telegram-bot
+litellm
+trafilatura
+python-dotenv
+google-generativeai
