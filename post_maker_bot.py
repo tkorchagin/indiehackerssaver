@@ -25,6 +25,43 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def markdown_to_html(text):
+    """Convert Markdown formatting to Telegram HTML."""
+    import html
+
+    # Replace guillemets (« ») with regular quotes
+    text = text.replace('«', '"').replace('»', '"')
+
+    # Replace ё with е
+    text = text.replace('ё', 'е').replace('Ё', 'Е')
+
+    # First, protect URLs from being modified
+    url_pattern = r'(https?://[^\s]+)'
+    urls = re.findall(url_pattern, text)
+    url_placeholders = {}
+    for i, url in enumerate(urls):
+        placeholder = f"__URL_PLACEHOLDER_{i}__"
+        url_placeholders[placeholder] = html.escape(url)
+        text = text.replace(url, placeholder)
+
+    # Escape HTML special characters (except our placeholders)
+    text = html.escape(text)
+
+    # Restore URL placeholders
+    for placeholder, url in url_placeholders.items():
+        text = text.replace(html.escape(placeholder), url)
+
+    # Convert **bold** to <b>bold</b>
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+
+    # Convert *italic* to <i>italic</i> (but not inside URLs)
+    text = re.sub(r'(?<![/:])\*([^*\n]+?)\*(?![/])', r'<i>\1</i>', text)
+
+    # Convert `code` to <code>code</code>
+    text = re.sub(r'`([^`]+?)`', r'<code>\1</code>', text)
+
+    return text
+
 def extract_content(text):
     """Extract content from URL or return original text."""
     url_pattern = r'https?://[^\s]+'
@@ -111,9 +148,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f.write(reply_text)
         logger.info(f"Saved LLM response to {response_file}")
         
-        # Delete status message and send response
+        # Delete status message and send response as reply to original message
         await status_message.delete()
-        await update.message.reply_text(reply_text, parse_mode='Markdown')
+        try:
+            html_text = markdown_to_html(reply_text)
+            await update.message.reply_text(html_text, parse_mode='HTML', do_quote=True)
+        except Exception as parse_error:
+            logger.warning(f"HTML parse failed, sending as plain text: {parse_error}")
+            await update.message.reply_text(reply_text, do_quote=True)
 
     except Exception as e:
         logger.error(f"Error in handle_message: {str(e)}", exc_info=True)
