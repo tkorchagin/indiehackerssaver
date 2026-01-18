@@ -7,6 +7,7 @@ import trafilatura
 from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
 from litellm import completion
 
@@ -14,8 +15,8 @@ from litellm import completion
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini/gemini-3-pro-preview")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+LLM_MODEL = os.getenv("LLM_MODEL", "openrouter/google/gemini-3-pro-preview")
 ADMIN_ID = os.getenv("ADMIN_ID")
 
 # Configure logging
@@ -108,8 +109,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_text:
         return
 
-    # Send "Thinking..." message
-    status_message = await update.message.reply_text("⏳ Обрабатываю... завариваю кофе для Gemini...")
+    # Send typing action and status message
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    status_message = await update.message.reply_text("⏳ Обрабатываю...")
 
     try:
         # Extract content
@@ -135,7 +137,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": content}
             ],
-            api_key=GEMINI_API_KEY
+            api_key=OPENROUTER_API_KEY
         )
 
         reply_text = response.choices[0].message.content
@@ -161,7 +163,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error in handle_message: {str(e)}", exc_info=True)
         error_msg = str(e)
         if "quota" in error_msg.lower() or "429" in error_msg:
-            friendly_error = "🔔 Лимит запросов исчерпан (Quota Exceeded). Пожалуйста, подождите или проверьте биллинг в Google AI Studio."
+            friendly_error = "🔔 Лимит запросов исчерпан (Quota Exceeded). Пожалуйста, подождите или проверьте биллинг в OpenRouter."
         else:
             friendly_error = f"❌ Произошла ошибка: {error_msg[:200]}"
             
