@@ -69,22 +69,46 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def extract_url_with_parens(text, start_pos):
+    """Extract URL starting at start_pos, handling balanced parentheses (for Wikipedia URLs)."""
+    url = ""
+    paren_depth = 0
+    i = start_pos
+
+    while i < len(text):
+        char = text[i]
+        # Stop at whitespace or certain characters
+        if char in ' \t\n\r<>"\'':
+            break
+        if char == '(':
+            paren_depth += 1
+            url += char
+        elif char == ')':
+            if paren_depth > 0:
+                paren_depth -= 1
+                url += char
+            else:
+                # Unmatched ) - stop here (likely markdown syntax)
+                break
+        else:
+            url += char
+        i += 1
+
+    return url
+
+
 def strip_utm_params(text):
     """Remove UTM parameters from all URLs in text."""
     from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
-    url_pattern = r'https?://[^\s<>"\'\)]+'
-
-    def clean_url(match):
-        url = match.group(0)
+    def clean_single_url(url):
+        """Clean UTM params from a single URL."""
         try:
             parsed = urlparse(url)
-            # Filter out utm_ parameters
             params = parse_qs(parsed.query, keep_blank_values=True)
             clean_params = {k: v for k, v in params.items() if not k.lower().startswith('utm_')}
-            # Rebuild URL
             clean_query = urlencode(clean_params, doseq=True)
-            clean_url = urlunparse((
+            result = urlunparse((
                 parsed.scheme,
                 parsed.netloc,
                 parsed.path,
@@ -92,14 +116,27 @@ def strip_utm_params(text):
                 clean_query,
                 parsed.fragment
             ))
-            # Remove trailing ? if no params left
-            if clean_url.endswith('?'):
-                clean_url = clean_url[:-1]
-            return clean_url
+            if result.endswith('?'):
+                result = result[:-1]
+            return result
         except:
             return url
 
-    return re.sub(url_pattern, clean_url, text)
+    # Find and replace URLs with balanced parentheses handling
+    result = []
+    i = 0
+    while i < len(text):
+        # Look for http:// or https://
+        if text[i:i+7].lower() == 'http://' or text[i:i+8].lower() == 'https://':
+            url = extract_url_with_parens(text, i)
+            clean_url = clean_single_url(url)
+            result.append(clean_url)
+            i += len(url)
+        else:
+            result.append(text[i])
+            i += 1
+
+    return ''.join(result)
 
 
 def markdown_to_html(text):
