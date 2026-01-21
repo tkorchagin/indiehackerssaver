@@ -5,6 +5,7 @@ import logging
 import asyncio
 import random
 import subprocess
+import requests
 import trafilatura
 from pathlib import Path
 from dotenv import load_dotenv
@@ -34,10 +35,14 @@ STATUS_MESSAGES = [
 # Maximum number of stored generations per user
 MAX_STORED_GENERATIONS = 10
 
+# Message batching settings
+MESSAGE_BATCH_DELAY = 0.3  # seconds to wait for more messages
+message_batches = {}  # user_id -> {messages: [], first_update: Update, task: Task}
+
 # Prompt modifiers for regeneration
 PROMPT_MODIFIERS = {
-    "shorter": """ВАЖНО: Сделай пост ЗНАЧИТЕЛЬНО короче. Максимум 800-1000 символов.
-Сохрани главную мысль, убери всё второстепенное. Будь максимально лаконичен.""",
+    "shorter": """ВАЖНО: Сделай пост ОЧЕНЬ коротким. Максимум 500 символов.
+Оставь только самую суть, одну главную мысль. Убери всё лишнее.""",
 
     "regenerate": """ВАЖНО: Напиши ДРУГОЙ вариант поста с ДРУГИМ углом подачи.
 Используй другую структуру, другой хук, другие акценты. Не повторяй предыдущий вариант.""",
@@ -54,12 +59,48 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 LLM_MODEL = os.getenv("LLM_MODEL", "openrouter/google/gemini-3-pro-preview")
 ADMIN_ID = os.getenv("ADMIN_ID")
 
+# Proxy URL for fallback content fetching
+PROXY_URL = "https://api.allorigins.win/raw?url="
+
 # Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+def strip_utm_params(text):
+    """Remove UTM parameters from all URLs in text."""
+    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+    url_pattern = r'https?://[^\s<>"\'\)]+'
+
+    def clean_url(match):
+        url = match.group(0)
+        try:
+            parsed = urlparse(url)
+            # Filter out utm_ parameters
+            params = parse_qs(parsed.query, keep_blank_values=True)
+            clean_params = {k: v for k, v in params.items() if not k.lower().startswith('utm_')}
+            # Rebuild URL
+            clean_query = urlencode(clean_params, doseq=True)
+            clean_url = urlunparse((
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                parsed.params,
+                clean_query,
+                parsed.fragment
+            ))
+            # Remove trailing ? if no params left
+            if clean_url.endswith('?'):
+                clean_url = clean_url[:-1]
+            return clean_url
+        except:
+            return url
+
+    return re.sub(url_pattern, clean_url, text)
+
 
 def markdown_to_html(text):
     """Convert Markdown formatting to Telegram HTML."""
@@ -101,6 +142,20 @@ def markdown_to_html(text):
 
     return text
 
+def fetch_via_proxy(url):
+    """Fetch URL content via proxy service."""
+    try:
+        proxy_url = f"{PROXY_URL}{url}"
+        logger.info(f"Trying proxy fetch: {proxy_url}")
+        response = requests.get(proxy_url, timeout=30)
+        if response.status_code == 200 and len(response.text) > 100:
+            logger.info(f"Proxy fetch successful ({len(response.text)} chars)")
+            return response.text
+        logger.warning(f"Proxy returned status {response.status_code} or short content")
+    except Exception as e:
+        logger.warning(f"Proxy fetch failed: {e}")
+    return None
+
 def extract_content(text):
     """Extract content from URL or return original text. Returns None if URL extraction fails."""
     url_pattern = r'https?://[^\s]+'
@@ -114,18 +169,29 @@ def extract_content(text):
     if urls:
         url = urls[0]
         logger.info(f"Extracting content from URL: {url}")
+
+        # Try direct fetch first
         downloaded = trafilatura.fetch_url(url)
         if downloaded:
             extracted = trafilatura.extract(downloaded, output_format='markdown', include_links=True)
             if extracted and len(extracted) > 100:
                 logger.info(f"Successfully extracted {len(extracted)} chars from {url}")
                 return extracted
-            else:
-                logger.warning(f"Trafilatura returned empty/short content for {url}")
-                return None
+            logger.warning(f"Trafilatura returned empty/short content for {url}")
         else:
-            logger.warning(f"Failed to download content from {url}")
-            return None
+            logger.warning(f"Direct fetch failed for {url}")
+
+        # Fallback to proxy
+        logger.info(f"Trying proxy fallback for {url}")
+        proxy_html = fetch_via_proxy(url)
+        if proxy_html:
+            extracted = trafilatura.extract(proxy_html, output_format='markdown', include_links=True)
+            if extracted and len(extracted) > 100:
+                logger.info(f"Successfully extracted {len(extracted)} chars via proxy from {url}")
+                return extracted
+            logger.warning(f"Proxy HTML extraction returned empty/short content for {url}")
+
+        return None
     return text
 
 def get_prompt():
@@ -144,10 +210,7 @@ def create_post_keyboard(message_id: int) -> InlineKeyboardMarkup:
     keyboard = [
         [
             InlineKeyboardButton("✂️ Короче", callback_data=f"shorter:{message_id}"),
-            InlineKeyboardButton("🔄 Другой", callback_data=f"regenerate:{message_id}"),
-        ],
-        [
-            InlineKeyboardButton("📝 Правки", callback_data=f"edits:{message_id}"),
+            InlineKeyboardButton("🔄 Переделать", callback_data=f"regenerate:{message_id}"),
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -245,6 +308,7 @@ async def regenerate_post(update: Update, context: ContextTypes.DEFAULT_TYPE, ge
 
         # Delete status and send new post
         await status_message.delete()
+        reply_text = strip_utm_params(reply_text)
 
         try:
             html_text = markdown_to_html(reply_text)
@@ -306,51 +370,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['waiting_for_edits'] = int(message_id)
         await query.message.reply_text("✏️ Напишите, какие правки внести в пост:")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def process_message_content(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str):
+    """Main message processing logic. Called after message batching."""
     user = update.effective_user
     user_id = str(user.id)
-    user_text = update.message.text
-
-    logger.info(f"Received message from {user.username} ({user_id}): {user_text[:50]}...")
-
-    # Filter by Admin ID if set
-    if ADMIN_ID and user_id != str(ADMIN_ID):
-        logger.warning(f"Unauthorized access attempt by {user_id}")
-        # Optionally reply to unauthorized users, or just ignore
-        # await update.message.reply_text("⛔️ У вас нет доступа к этому боту.")
-        return
-
-    if not user_text:
-        return
-
-    # Check if user is providing custom edits after pressing "📝 Правки" button
-    if context.user_data.get('waiting_for_edits'):
-        message_id = context.user_data.pop('waiting_for_edits')
-        gen_data = get_generation(context, message_id)
-        if gen_data:
-            await regenerate_post(update, context, gen_data, "custom", custom_edits=user_text)
-            return
-        else:
-            await update.message.reply_text("❌ Данные о генерации не найдены.")
-            return
-
-    # Check if this is a reply to a generated post
-    if update.message.reply_to_message:
-        replied_message_id = update.message.reply_to_message.message_id
-        gen_data = get_generation(context, replied_message_id)
-        if gen_data:
-            # Check for reply commands
-            text_lower = user_text.lower().strip()
-            if text_lower in ['короче', 'shorter']:
-                await regenerate_post(update, context, gen_data, "shorter")
-                return
-            elif text_lower in ['другой', 'еще', 'ещe', 'еще раз', 'другой вариант']:
-                await regenerate_post(update, context, gen_data, "regenerate")
-                return
-            else:
-                # Treat as custom edits
-                await regenerate_post(update, context, gen_data, "custom", custom_edits=user_text)
-                return
 
     # Send typing action and status message
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
@@ -412,6 +435,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Delete status message and send response as reply to original message with keyboard
         await status_message.delete()
+        reply_text = strip_utm_params(reply_text)
         try:
             html_text = markdown_to_html(reply_text)
             sent_message = await update.message.reply_text(
@@ -437,7 +461,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stop_event.set()
         status_task.cancel()
 
-        logger.error(f"Error in handle_message: {str(e)}", exc_info=True)
+        logger.error(f"Error in process_message_content: {str(e)}", exc_info=True)
         error_msg = str(e)
         if "quota" in error_msg.lower() or "429" in error_msg:
             friendly_error = "🔔 Лимит запросов исчерпан (Quota Exceeded). Пожалуйста, подождите или проверьте биллинг в OpenRouter."
@@ -445,6 +469,89 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             friendly_error = f"❌ Произошла ошибка: {error_msg[:200]}"
 
         await status_message.edit_text(friendly_error)
+
+
+async def process_batched_messages(user_id: str, context: ContextTypes.DEFAULT_TYPE):
+    """Process accumulated messages after batch delay."""
+    await asyncio.sleep(MESSAGE_BATCH_DELAY)
+
+    if user_id not in message_batches:
+        return
+
+    batch = message_batches.pop(user_id)
+    messages = batch['messages']
+    first_update = batch['first_update']
+
+    # Concatenate all messages
+    combined_text = '\n\n'.join(messages)
+    logger.info(f"Processing batch of {len(messages)} messages for user {user_id}: {combined_text[:100]}...")
+
+    # Process the combined message using the first update for reply
+    await process_message_content(first_update, context, combined_text)
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = str(user.id)
+    user_text = update.message.text
+
+    logger.info(f"Received message from {user.username} ({user_id}): {user_text[:50]}...")
+
+    # Filter by Admin ID if set
+    if ADMIN_ID and user_id != str(ADMIN_ID):
+        logger.warning(f"Unauthorized access attempt by {user_id}")
+        return
+
+    if not user_text:
+        return
+
+    # Check if user is providing custom edits after pressing "📝 Правки" button
+    if context.user_data.get('waiting_for_edits'):
+        message_id = context.user_data.pop('waiting_for_edits')
+        gen_data = get_generation(context, message_id)
+        if gen_data:
+            await regenerate_post(update, context, gen_data, "custom", custom_edits=user_text)
+            return
+        else:
+            await update.message.reply_text("❌ Данные о генерации не найдены.")
+            return
+
+    # Check if this is a reply to a generated post
+    if update.message.reply_to_message:
+        replied_message_id = update.message.reply_to_message.message_id
+        gen_data = get_generation(context, replied_message_id)
+        if gen_data:
+            # Check for reply commands
+            text_lower = user_text.lower().strip()
+            if text_lower in ['короче', 'shorter']:
+                await regenerate_post(update, context, gen_data, "shorter")
+                return
+            elif text_lower in ['другой', 'еще', 'ещe', 'еще раз', 'другой вариант']:
+                await regenerate_post(update, context, gen_data, "regenerate")
+                return
+            else:
+                # Treat as custom edits
+                await regenerate_post(update, context, gen_data, "custom", custom_edits=user_text)
+                return
+
+    # Message batching logic
+    if user_id in message_batches:
+        # Cancel existing timer and add message to batch
+        batch = message_batches[user_id]
+        batch['task'].cancel()
+        batch['messages'].append(user_text)
+        logger.info(f"Added message to batch for user {user_id}, total: {len(batch['messages'])}")
+    else:
+        # Create new batch
+        message_batches[user_id] = {
+            'messages': [user_text],
+            'first_update': update,
+        }
+        logger.info(f"Created new batch for user {user_id}")
+
+    # Start new timer
+    task = asyncio.create_task(process_batched_messages(user_id, context))
+    message_batches[user_id]['task'] = task
 
 async def fetch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
