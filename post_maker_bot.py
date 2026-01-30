@@ -7,12 +7,17 @@ import random
 import subprocess
 import requests
 import trafilatura
+import feedparser
 from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, CallbackQueryHandler, filters
 from litellm import completion
+from openpyxl import load_workbook
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+import pytz
 
 # Fun status messages while processing
 STATUS_MESSAGES = [
@@ -21,12 +26,10 @@ STATUS_MESSAGES = [
     "✍️ Пишу черновик...",
     "🎨 Добавляю огонька...",
     "💡 Формулирую мысль...",
-    "🚀 Почти готово...",
     "🔥 Делаю пост виральным...",
     "📝 Редактирую текст...",
     "🎯 Ловлю суть...",
     "⚡ Генерирую контент...",
-    "🤖 Нейросеть думает...",
     "💭 Анализирую историю...",
     "🏗️ Собираю пост...",
     "✨ Полирую формулировки...",
@@ -46,6 +49,9 @@ PROMPT_MODIFIERS = {
 
     "regenerate": """ВАЖНО: Напиши ДРУГОЙ вариант поста с ДРУГИМ углом подачи.
 Используй другую структуру, другой хук, другие акценты. Не повторяй предыдущий вариант.""",
+
+    "no_promo": """ВАЖНО: Убери из поста ВСЕ приглашения, призывы к действию, ссылки на курсы, подписки, каналы и любые промо-элементы.
+Оставь только основной контент без призывов что-то купить, подписаться или перейти куда-то. Пост должен быть чисто информативным.""",
 
     "custom": """ВАЖНО: Учти эти правки при переписывании поста:
 {edits}"""
@@ -248,6 +254,9 @@ def create_post_keyboard(message_id: int) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("✂️ Короче", callback_data=f"shorter:{message_id}"),
             InlineKeyboardButton("🔄 Переделать", callback_data=f"regenerate:{message_id}"),
+        ],
+        [
+            InlineKeyboardButton("🚫 Убрать промо", callback_data=f"no_promo:{message_id}"),
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -402,6 +411,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await regenerate_post(update, context, gen_data, "shorter")
     elif action == "regenerate":
         await regenerate_post(update, context, gen_data, "regenerate")
+    elif action == "no_promo":
+        await regenerate_post(update, context, gen_data, "no_promo")
     elif action == "edits":
         # Set waiting for edits state
         context.user_data['waiting_for_edits'] = int(message_id)
@@ -518,10 +529,36 @@ async def process_batched_messages(user_id: str, context: ContextTypes.DEFAULT_T
     batch = message_batches.pop(user_id)
     messages = batch['messages']
     first_update = batch['first_update']
+    replied_message_id = batch.get('replied_message_id')
+    waiting_for_edits_id = batch.get('waiting_for_edits_id')
 
     # Concatenate all messages
     combined_text = '\n\n'.join(messages)
     logger.info(f"Processing batch of {len(messages)} messages for user {user_id}: {combined_text[:100]}...")
+
+    # Check if user was waiting for custom edits
+    if waiting_for_edits_id:
+        gen_data = get_generation(context, waiting_for_edits_id)
+        if gen_data:
+            await regenerate_post(first_update, context, gen_data, "custom", custom_edits=combined_text)
+            return
+
+    # Check if this is a reply to a generated post
+    if replied_message_id:
+        gen_data = get_generation(context, replied_message_id)
+        if gen_data:
+            # Check for reply commands in the combined text
+            text_lower = combined_text.lower().strip()
+            if text_lower in ['короче', 'shorter']:
+                await regenerate_post(first_update, context, gen_data, "shorter")
+                return
+            elif text_lower in ['другой', 'еще', 'ещe', 'еще раз', 'другой вариант']:
+                await regenerate_post(first_update, context, gen_data, "regenerate")
+                return
+            else:
+                # Treat as custom edits with combined text
+                await regenerate_post(first_update, context, gen_data, "custom", custom_edits=combined_text)
+                return
 
     # Process the combined message using the first update for reply
     await process_message_content(first_update, context, combined_text)
@@ -547,53 +584,128 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message_id = context.user_data.pop('waiting_for_edits')
         gen_data = get_generation(context, message_id)
         if gen_data:
-            await regenerate_post(update, context, gen_data, "custom", custom_edits=user_text)
+            # Still use batching for edits
+            if user_id in message_batches:
+                batch = message_batches[user_id]
+                batch['task'].cancel()
+                batch['messages'].append(user_text)
+                batch['waiting_for_edits_id'] = message_id
+            else:
+                message_batches[user_id] = {
+                    'messages': [user_text],
+                    'first_update': update,
+                    'waiting_for_edits_id': message_id,
+                }
+            task = asyncio.create_task(process_batched_messages(user_id, context))
+            message_batches[user_id]['task'] = task
             return
         else:
             await update.message.reply_text("❌ Данные о генерации не найдены.")
             return
 
-    # Check if this is a reply to a generated post
+    # Determine if this is a reply to a generated post
+    replied_message_id = None
     if update.message.reply_to_message:
         replied_message_id = update.message.reply_to_message.message_id
-        gen_data = get_generation(context, replied_message_id)
-        if gen_data:
-            # Check for reply commands
-            text_lower = user_text.lower().strip()
-            if text_lower in ['короче', 'shorter']:
-                await regenerate_post(update, context, gen_data, "shorter")
-                return
-            elif text_lower in ['другой', 'еще', 'ещe', 'еще раз', 'другой вариант']:
-                await regenerate_post(update, context, gen_data, "regenerate")
-                return
-            else:
-                # Treat as custom edits
-                await regenerate_post(update, context, gen_data, "custom", custom_edits=user_text)
-                return
+        # Only consider it a reply if generation data exists
+        if not get_generation(context, replied_message_id):
+            replied_message_id = None
 
-    # Message batching logic
+    # Message batching logic - works for both regular messages and replies
     if user_id in message_batches:
         # Cancel existing timer and add message to batch
         batch = message_batches[user_id]
         batch['task'].cancel()
         batch['messages'].append(user_text)
+        # Update replied_message_id if needed (should be same for all messages in batch)
+        if replied_message_id:
+            batch['replied_message_id'] = replied_message_id
         logger.info(f"Added message to batch for user {user_id}, total: {len(batch['messages'])}")
     else:
         # Create new batch
-        message_batches[user_id] = {
+        batch_data = {
             'messages': [user_text],
             'first_update': update,
         }
-        logger.info(f"Created new batch for user {user_id}")
+        if replied_message_id:
+            batch_data['replied_message_id'] = replied_message_id
+        message_batches[user_id] = batch_data
+        logger.info(f"Created new batch for user {user_id}" + (f" (reply to {replied_message_id})" if replied_message_id else ""))
 
     # Start new timer
     task = asyncio.create_task(process_batched_messages(user_id, context))
     message_batches[user_id]['task'] = task
 
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command."""
+    user = update.effective_user
+    user_id = str(user.id)
+
+    logger.info(f"Received /start command from {user.username} ({user_id})")
+
+    welcome_text = """🤖 Привет! Я бот для создания вирусных постов из статей про стартапы.
+
+<b>Как пользоваться:</b>
+• Кинь мне ссылку на статью или текст
+• Я сгенерирую пост в стиле Indie Hackers
+• Ты сможешь переделать пост кнопками или ответом
+
+<b>Как редактировать посты:</b>
+• Нажми "✂️ Короче" для короткой версии
+• Нажми "🔄 Переделать" для другого варианта
+• Или просто ответь на пост с правками
+
+<b>Батчинг сообщений:</b>
+Если ты кидаешь длинный текст, который Telegram разбивает на части, я автоматически склею все части и обработаю как одно сообщение. Это работает и для ответов на посты!
+
+Давай создадим что-то вирусное! 🚀"""
+
+    await update.message.reply_text(welcome_text, parse_mode='HTML')
+
+def format_story(story_data, index=None):
+    """Format a single story for display."""
+    prefix = f"{index}. " if index else "• "
+    title = story_data.get('Title', 'No Title')
+    author = story_data.get('Author', '')
+    product = story_data.get('Product', '')
+    mrr = story_data.get('MRR', '')
+    url = story_data.get('URL', '')
+
+    text = f"{prefix}<b>{title}</b>\n"
+    if author:
+        text += f"👤 {author}\n"
+    if product:
+        text += f"🚀 {product}\n"
+    if mrr:
+        text += f"💰 {mrr}\n"
+    text += f"🔗 {url}\n"
+
+    return text
+
+def read_stories_from_excel(file_path):
+    """Read stories from Excel file."""
+    wb = load_workbook(file_path)
+    ws = wb.active
+
+    stories = []
+    # Skip header row
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if row[0] or row[1]:  # At least ID or Title exists
+            stories.append({
+                'ID': row[0] or '',
+                'Title': row[1] or '',
+                'Author': row[2] or '',
+                'Product': row[3] or '',
+                'MRR': row[4] or '',
+                'URL': row[5] or ''
+            })
+
+    return stories
+
 async def fetch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = str(user.id)
-    
+
     logger.info(f"Received /fetch command from {user.username} ({user_id})")
 
     # Filter by Admin ID if set
@@ -613,22 +725,60 @@ async def fetch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=True,
             check=True
         )
-        
+
         logger.info(f"Fetch script output: {result.stdout}")
-        
+
         # The script saves to output/stories.xlsx
         output_file = Path("output/stories.xlsx")
-        
+
         if output_file.exists():
-            await status_message.edit_text("✅ Парсинг завершен. Отправляю файл...")
-            await update.message.reply_document(
-                document=open(output_file, "rb"),
-                filename="stories.xlsx",
-                caption="Вот свежий список историй 📂"
-            )
+            await status_message.edit_text("✅ Парсинг завершен. Отправляю данные...")
+
+            # Send the file
+            with open(output_file, "rb") as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename="stories.xlsx",
+                    caption="📊 Полный список историй"
+                )
+
+            # Read stories from the file
+            stories = read_stories_from_excel(output_file)
+
+            if stories:
+                # Top 10 latest stories (first in the list)
+                top_10 = stories[:10]
+                top_10_text = "🔥 <b>Топ 10 последних историй:</b>\n\n"
+                for i, story in enumerate(top_10, 1):
+                    top_10_text += format_story(story, i) + "\n"
+
+                # Send top 10 (may need to split if too long)
+                try:
+                    await update.message.reply_text(top_10_text, parse_mode='HTML', disable_web_page_preview=True)
+                except Exception as e:
+                    logger.warning(f"Failed to send top 10 as HTML: {e}")
+                    # Try splitting or sending as plain text
+                    await update.message.reply_text("⚠️ Список слишком длинный, смотри в файле")
+
+                # 3 random stories
+                if len(stories) > 10:
+                    random_stories = random.sample(stories, min(3, len(stories)))
+                    random_text = "🎲 <b>3 случайные истории:</b>\n\n"
+                    for story in random_stories:
+                        random_text += format_story(story) + "\n"
+
+                    try:
+                        await update.message.reply_text(random_text, parse_mode='HTML', disable_web_page_preview=True)
+                    except Exception as e:
+                        logger.warning(f"Failed to send random stories as HTML: {e}")
+                        await update.message.reply_text("⚠️ Не удалось отправить случайные истории")
+
+                await status_message.delete()
+            else:
+                await status_message.edit_text("⚠️ Файл пустой, истории не найдены")
         else:
             await status_message.edit_text("⚠️ Скрипт завершился, но файл не найден.")
-            
+
     except subprocess.CalledProcessError as e:
         logger.error(f"Error running fetch script: {e.stderr}")
         await status_message.edit_text(f"❌ Ошибка при выполнении скрипта:\n{e.stderr[:200]}")
@@ -636,14 +786,573 @@ async def fetch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error in fetch_command: {e}", exc_info=True)
         await status_message.edit_text(f"❌ Неизвестная ошибка: {str(e)}")
 
+async def random_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fetch a random article from Indie Hackers or TechCrunch and generate a post."""
+    user = update.effective_user
+    user_id = str(user.id)
+
+    logger.info(f"Received /random command from {user.username} ({user_id})")
+
+    # Filter by Admin ID if set
+    if ADMIN_ID and user_id != str(ADMIN_ID):
+        logger.warning(f"Unauthorized /random attempt by {user_id}")
+        return
+
+    status_message = await update.message.reply_text("🎲 Ищу случайную статью...")
+
+    try:
+        # Randomly choose source: Indie Hackers or TechCrunch
+        source = random.choice(['indiehackers', 'techcrunch'])
+
+        article_url = None
+        article_title = None
+        article_info = None
+
+        if source == 'techcrunch':
+            # Fetch TechCrunch RSS
+            logger.info("Fetching random article from TechCrunch")
+            feed_url = 'https://techcrunch.com/feed/'
+            feed = await asyncio.to_thread(feedparser.parse, feed_url)
+
+            if not feed.entries:
+                await status_message.edit_text("❌ Не удалось загрузить статьи TechCrunch")
+                return
+
+            # Get random article from first 20
+            articles = feed.entries[:20]
+            random_article = random.choice(articles)
+
+            article_url = random_article.get('link', '')
+            article_title = random_article.get('title', 'No Title')
+            published = random_article.get('published', '')
+
+            # Parse date
+            date_str = ''
+            if published:
+                try:
+                    from datetime import datetime
+                    pub_date = datetime.strptime(published, '%a, %d %b %Y %H:%M:%S %z')
+                    date_str = pub_date.strftime('%d.%m.%Y')
+                except:
+                    date_str = published.split(',')[0] if ',' in published else ''
+
+            article_info = f"🔥 <b>TechCrunch</b>\n\n<b>{article_title}</b>\n"
+            if date_str:
+                article_info += f"📅 {date_str}\n"
+            article_info += f"🔗 {article_url}\n\n⏳ Генерирую пост..."
+
+        else:  # indiehackers
+            # Read stories from Excel if exists
+            logger.info("Fetching random article from Indie Hackers")
+            output_file = Path("output/stories.xlsx")
+
+            if not output_file.exists():
+                # Fallback to TechCrunch if no stories file
+                logger.warning("stories.xlsx not found, falling back to TechCrunch")
+                await status_message.edit_text("⚠️ Файл с историями Indie Hackers не найден. Используйте /fetch сначала.\n\nПереключаюсь на TechCrunch...")
+                await asyncio.sleep(2)
+
+                # Fetch from TechCrunch instead
+                feed_url = 'https://techcrunch.com/feed/'
+                feed = await asyncio.to_thread(feedparser.parse, feed_url)
+
+                if not feed.entries:
+                    await status_message.edit_text("❌ Не удалось загрузить статьи")
+                    return
+
+                articles = feed.entries[:20]
+                random_article = random.choice(articles)
+
+                article_url = random_article.get('link', '')
+                article_title = random_article.get('title', 'No Title')
+                article_info = f"🔥 <b>TechCrunch</b>\n\n<b>{article_title}</b>\n🔗 {article_url}\n\n⏳ Генерирую пост..."
+            else:
+                stories = read_stories_from_excel(output_file)
+
+                if not stories:
+                    await status_message.edit_text("❌ Файл историй пуст")
+                    return
+
+                # Get random story from all stories (up to 100)
+                stories_subset = stories[:min(100, len(stories))]
+                random_story = random.choice(stories_subset)
+
+                article_url = random_story.get('URL', '')
+                article_title = random_story.get('Title', 'No Title')
+                author = random_story.get('Author', '')
+                product = random_story.get('Product', '')
+                mrr = random_story.get('MRR', '')
+
+                article_info = f"🚀 <b>Indie Hackers</b>\n\n<b>{article_title}</b>\n"
+                if author:
+                    article_info += f"👤 {author}\n"
+                if product:
+                    article_info += f"🏗️ {product}\n"
+                if mrr:
+                    article_info += f"💰 {mrr}\n"
+                article_info += f"🔗 {article_url}\n\n⏳ Генерирую пост..."
+
+        # Send article info
+        await status_message.edit_text(article_info, parse_mode='HTML', disable_web_page_preview=True)
+
+        # Now generate post from this URL
+        if not article_url:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ Не удалось получить URL статьи")
+            return
+
+        logger.info(f"Generating post for random article: {article_url}")
+
+        # Send typing action and new status message
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+        generation_status = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="🧠 Читаю статью...",
+            reply_to_message_id=status_message.message_id
+        )
+
+        # Start status updater
+        stop_event = asyncio.Event()
+        status_task = asyncio.create_task(update_status_periodically(generation_status, stop_event))
+
+        try:
+            # Extract content
+            content = extract_content(article_url)
+
+            if content is None:
+                stop_event.set()
+                status_task.cancel()
+                await generation_status.edit_text("❌ Не удалось извлечь контент из ссылки.")
+                return
+
+            system_prompt = get_prompt()
+
+            # Save extracted content
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            debug_dir = Path("debug")
+            debug_dir.mkdir(exist_ok=True)
+
+            extracted_file = debug_dir / f"{user_id}_{timestamp}_random_extracted.md"
+            with open(extracted_file, "w", encoding="utf-8") as f:
+                f.write(content)
+            logger.info(f"Saved extracted content to {extracted_file}")
+
+            # Call LLM
+            logger.info(f"Calling LLM ({LLM_MODEL})...")
+            response = await asyncio.to_thread(
+                completion,
+                model=LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": content}
+                ],
+                api_key=OPENROUTER_API_KEY
+            )
+
+            reply_text = response.choices[0].message.content
+            logger.info(f"Successfully received response from LLM ({len(reply_text)} chars)")
+
+            # Stop status updater
+            stop_event.set()
+            status_task.cancel()
+
+            # Save LLM response
+            response_file = debug_dir / f"{user_id}_{timestamp}_random_response.md"
+            with open(response_file, "w", encoding="utf-8") as f:
+                f.write(reply_text)
+            logger.info(f"Saved LLM response to {response_file}")
+
+            # Delete status message and send response
+            await generation_status.delete()
+            reply_text = strip_utm_params(reply_text)
+
+            try:
+                html_text = markdown_to_html(reply_text)
+                sent_message = await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=html_text,
+                    parse_mode='HTML',
+                    reply_to_message_id=status_message.message_id,
+                    reply_markup=create_post_keyboard(0)
+                )
+            except Exception as parse_error:
+                logger.warning(f"HTML parse failed, sending as plain text: {parse_error}")
+                sent_message = await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=reply_text,
+                    reply_to_message_id=status_message.message_id,
+                    reply_markup=create_post_keyboard(0)
+                )
+
+            # Update keyboard with correct message_id and save generation
+            await sent_message.edit_reply_markup(reply_markup=create_post_keyboard(sent_message.message_id))
+            save_generation(context, sent_message.message_id, content, reply_text)
+
+        except Exception as e:
+            stop_event.set()
+            status_task.cancel()
+            logger.error(f"Error generating post: {str(e)}", exc_info=True)
+            await generation_status.edit_text(f"❌ Ошибка при генерации: {str(e)[:200]}")
+
+    except Exception as e:
+        logger.error(f"Error in random_command: {e}", exc_info=True)
+        await status_message.edit_text(f"❌ Ошибка: {str(e)[:200]}")
+
+async def techcrunch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fetch latest articles from TechCrunch RSS feed."""
+    user = update.effective_user
+    user_id = str(user.id)
+
+    logger.info(f"Received /techcrunch command from {user.username} ({user_id})")
+
+    # Filter by Admin ID if set
+    if ADMIN_ID and user_id != str(ADMIN_ID):
+        logger.warning(f"Unauthorized /techcrunch attempt by {user_id}")
+        return
+
+    # Parse arguments: /techcrunch [count] [category]
+    args = context.args
+    count = 10  # default
+    category = None
+
+    # Available categories
+    categories = {
+        'startups': 'https://techcrunch.com/category/startups/feed/',
+        'ai': 'https://techcrunch.com/category/artificial-intelligence/feed/',
+        'apps': 'https://techcrunch.com/category/apps/feed/',
+        'crypto': 'https://techcrunch.com/category/cryptocurrency/feed/',
+        'venture': 'https://techcrunch.com/category/venture/feed/',
+        'security': 'https://techcrunch.com/category/security/feed/',
+    }
+
+    if args:
+        # Check if first arg is a number
+        if args[0].isdigit():
+            count = min(int(args[0]), 50)  # max 50
+            if len(args) > 1:
+                category = args[1].lower()
+        else:
+            category = args[0].lower()
+
+    # Determine feed URL
+    if category and category in categories:
+        feed_url = categories[category]
+        category_name = category.capitalize()
+    else:
+        feed_url = 'https://techcrunch.com/feed/'
+        category_name = 'All'
+
+    status_message = await update.message.reply_text(f"⏳ Загружаю статьи TechCrunch ({category_name})...")
+
+    try:
+        # Fetch RSS feed
+        logger.info(f"Fetching TechCrunch RSS: {feed_url}")
+        feed = await asyncio.to_thread(feedparser.parse, feed_url)
+
+        if not feed.entries:
+            await status_message.edit_text("❌ Не удалось загрузить статьи из RSS-ленты")
+            return
+
+        # Get requested number of entries
+        entries = feed.entries[:count]
+
+        # Format articles
+        response_text = f"🔥 <b>TechCrunch - {category_name}</b>\n"
+        response_text += f"Последние {len(entries)} статей:\n\n"
+
+        for i, entry in enumerate(entries, 1):
+            title = entry.get('title', 'No Title')
+            link = entry.get('link', '')
+            published = entry.get('published', '')
+
+            # Parse date if available
+            date_str = ''
+            if published:
+                try:
+                    from datetime import datetime
+                    pub_date = datetime.strptime(published, '%a, %d %b %Y %H:%M:%S %z')
+                    date_str = pub_date.strftime('%d.%m.%Y')
+                except:
+                    date_str = published.split(',')[0] if ',' in published else ''
+
+            response_text += f"{i}. <b>{title}</b>\n"
+            if date_str:
+                response_text += f"📅 {date_str}\n"
+            response_text += f"🔗 {link}\n\n"
+
+        # Add category help
+        if not category:
+            response_text += "\n💡 <b>Доступные категории:</b>\n"
+            response_text += "• /techcrunch 10 startups\n"
+            response_text += "• /techcrunch ai\n"
+            response_text += "• /techcrunch crypto\n"
+            response_text += "• /techcrunch venture\n"
+            response_text += "• /techcrunch security\n"
+
+        response_text += "\n📝 Кинь любую ссылку в чат для генерации поста!"
+
+        await status_message.delete()
+
+        # Send in chunks if too long (Telegram limit is 4096)
+        if len(response_text) > 4000:
+            # Split by articles
+            chunks = []
+            current_chunk = f"🔥 <b>TechCrunch - {category_name}</b>\n"
+            current_chunk += f"Последние {len(entries)} статей:\n\n"
+
+            for i, entry in enumerate(entries, 1):
+                title = entry.get('title', 'No Title')
+                link = entry.get('link', '')
+                published = entry.get('published', '')
+
+                date_str = ''
+                if published:
+                    try:
+                        from datetime import datetime
+                        pub_date = datetime.strptime(published, '%a, %d %b %Y %H:%M:%S %z')
+                        date_str = pub_date.strftime('%d.%m.%Y')
+                    except:
+                        date_str = published.split(',')[0] if ',' in published else ''
+
+                article_text = f"{i}. <b>{title}</b>\n"
+                if date_str:
+                    article_text += f"📅 {date_str}\n"
+                article_text += f"🔗 {link}\n\n"
+
+                if len(current_chunk) + len(article_text) > 3900:
+                    chunks.append(current_chunk)
+                    current_chunk = ""
+
+                current_chunk += article_text
+
+            if current_chunk:
+                chunks.append(current_chunk)
+
+            # Send chunks
+            for chunk in chunks:
+                await update.message.reply_text(chunk, parse_mode='HTML', disable_web_page_preview=True)
+        else:
+            await update.message.reply_text(response_text, parse_mode='HTML', disable_web_page_preview=True)
+
+        logger.info(f"Successfully sent {len(entries)} TechCrunch articles")
+
+    except Exception as e:
+        logger.error(f"Error in techcrunch_command: {e}", exc_info=True)
+        await status_message.edit_text(f"❌ Ошибка при загрузке TechCrunch: {str(e)[:200]}")
+
+async def scheduled_random_post(app):
+    """Send a random post at scheduled time (8 AM MSK)."""
+    logger.info("Running scheduled random post task")
+
+    if not ADMIN_ID:
+        logger.warning("ADMIN_ID not set, skipping scheduled post")
+        return
+
+    try:
+        chat_id = int(ADMIN_ID)
+
+        # Send initial message
+        status_message = await app.bot.send_message(
+            chat_id=chat_id,
+            text="🌅 Доброе утро! 🎲 Ищу случайную статью для тебя..."
+        )
+
+        # Choose random source
+        source = random.choice(['indiehackers', 'techcrunch'])
+
+        article_url = None
+        article_title = None
+        article_info = None
+
+        if source == 'techcrunch':
+            logger.info("Scheduled task: Fetching from TechCrunch")
+            feed_url = 'https://techcrunch.com/feed/'
+            feed = await asyncio.to_thread(feedparser.parse, feed_url)
+
+            if not feed.entries:
+                await status_message.edit_text("❌ Не удалось загрузить статьи TechCrunch")
+                return
+
+            articles = feed.entries[:20]
+            random_article = random.choice(articles)
+
+            article_url = random_article.get('link', '')
+            article_title = random_article.get('title', 'No Title')
+            published = random_article.get('published', '')
+
+            date_str = ''
+            if published:
+                try:
+                    from datetime import datetime
+                    pub_date = datetime.strptime(published, '%a, %d %b %Y %H:%M:%S %z')
+                    date_str = pub_date.strftime('%d.%m.%Y')
+                except:
+                    date_str = published.split(',')[0] if ',' in published else ''
+
+            article_info = f"🔥 <b>TechCrunch</b>\n\n<b>{article_title}</b>\n"
+            if date_str:
+                article_info += f"📅 {date_str}\n"
+            article_info += f"🔗 {article_url}\n\n⏳ Генерирую пост..."
+
+        else:  # indiehackers
+            logger.info("Scheduled task: Fetching from Indie Hackers")
+            output_file = Path("output/stories.xlsx")
+
+            if not output_file.exists():
+                logger.warning("Scheduled task: stories.xlsx not found, using TechCrunch")
+                await status_message.edit_text("⚠️ Файл с историями не найден, переключаюсь на TechCrunch...")
+                await asyncio.sleep(2)
+
+                feed_url = 'https://techcrunch.com/feed/'
+                feed = await asyncio.to_thread(feedparser.parse, feed_url)
+
+                if not feed.entries:
+                    await status_message.edit_text("❌ Не удалось загрузить статьи")
+                    return
+
+                articles = feed.entries[:20]
+                random_article = random.choice(articles)
+
+                article_url = random_article.get('link', '')
+                article_title = random_article.get('title', 'No Title')
+                article_info = f"🔥 <b>TechCrunch</b>\n\n<b>{article_title}</b>\n🔗 {article_url}\n\n⏳ Генерирую пост..."
+            else:
+                stories = read_stories_from_excel(output_file)
+
+                if not stories:
+                    await status_message.edit_text("❌ Файл историй пуст")
+                    return
+
+                stories_subset = stories[:min(100, len(stories))]
+                random_story = random.choice(stories_subset)
+
+                article_url = random_story.get('URL', '')
+                article_title = random_story.get('Title', 'No Title')
+                author = random_story.get('Author', '')
+                product = random_story.get('Product', '')
+                mrr = random_story.get('MRR', '')
+
+                article_info = f"🚀 <b>Indie Hackers</b>\n\n<b>{article_title}</b>\n"
+                if author:
+                    article_info += f"👤 {author}\n"
+                if product:
+                    article_info += f"🏗️ {product}\n"
+                if mrr:
+                    article_info += f"💰 {mrr}\n"
+                article_info += f"🔗 {article_url}\n\n⏳ Генерирую пост..."
+
+        # Send article info
+        await status_message.edit_text(article_info, parse_mode='HTML', disable_web_page_preview=True)
+
+        if not article_url:
+            await app.bot.send_message(chat_id=chat_id, text="❌ Не удалось получить URL статьи")
+            return
+
+        logger.info(f"Scheduled task: Generating post for {article_url}")
+
+        # Send typing and status
+        await app.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        generation_status = await app.bot.send_message(
+            chat_id=chat_id,
+            text="🧠 Читаю статью...",
+            reply_to_message_id=status_message.message_id
+        )
+
+        stop_event = asyncio.Event()
+        status_task = asyncio.create_task(update_status_periodically(generation_status, stop_event))
+
+        try:
+            content = extract_content(article_url)
+
+            if content is None:
+                stop_event.set()
+                status_task.cancel()
+                await generation_status.edit_text("❌ Не удалось извлечь контент")
+                return
+
+            system_prompt = get_prompt()
+
+            # Call LLM
+            logger.info(f"Scheduled task: Calling LLM...")
+            response = await asyncio.to_thread(
+                completion,
+                model=LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": content}
+                ],
+                api_key=OPENROUTER_API_KEY
+            )
+
+            reply_text = response.choices[0].message.content
+            logger.info(f"Scheduled task: Received LLM response ({len(reply_text)} chars)")
+
+            stop_event.set()
+            status_task.cancel()
+
+            await generation_status.delete()
+            reply_text = strip_utm_params(reply_text)
+
+            try:
+                html_text = markdown_to_html(reply_text)
+                sent_message = await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=html_text,
+                    parse_mode='HTML',
+                    reply_to_message_id=status_message.message_id,
+                    reply_markup=create_post_keyboard(0)
+                )
+            except Exception as parse_error:
+                logger.warning(f"HTML parse failed: {parse_error}")
+                sent_message = await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=reply_text,
+                    reply_to_message_id=status_message.message_id,
+                    reply_markup=create_post_keyboard(0)
+                )
+
+            # Update keyboard
+            await sent_message.edit_reply_markup(reply_markup=create_post_keyboard(sent_message.message_id))
+
+            logger.info("Scheduled task: Successfully sent random post")
+
+        except Exception as e:
+            stop_event.set()
+            status_task.cancel()
+            logger.error(f"Error in scheduled post generation: {str(e)}", exc_info=True)
+            await generation_status.edit_text(f"❌ Ошибка: {str(e)[:200]}")
+
+    except Exception as e:
+        logger.error(f"Error in scheduled_random_post: {e}", exc_info=True)
+
+async def post_init(app):
+    """Initialize scheduler after bot starts."""
+    scheduler = AsyncIOScheduler(timezone=pytz.timezone('Europe/Moscow'))
+
+    # Schedule daily post at 8:00 AM MSK
+    scheduler.add_job(
+        scheduled_random_post,
+        trigger=CronTrigger(hour=8, minute=0, timezone=pytz.timezone('Europe/Moscow')),
+        args=[app],
+        id='daily_morning_post',
+        name='Daily morning random post at 8 AM MSK',
+        replace_existing=True
+    )
+
+    scheduler.start()
+    logger.info("Scheduler started - Daily post will be sent at 8:00 AM MSK")
+
 if __name__ == '__main__':
     if not TELEGRAM_BOT_TOKEN:
         logger.error("Error: TELEGRAM_BOT_TOKEN not found in .env")
         exit(1)
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
+    app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("fetch", fetch_command))
+    app.add_handler(CommandHandler("techcrunch", techcrunch_command))
+    app.add_handler(CommandHandler("random", random_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 

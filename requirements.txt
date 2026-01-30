@@ -6,3 +6,6 @@ litellm
 trafilatura
 python-dotenv
 google-generativeai
+feedparser
+apscheduler
+pytz
