@@ -732,17 +732,21 @@ def screenshot_mockup(input_path, output_path, max_size=1024, padding=80, backgr
     elif img.mode != 'RGB':
         img = img.convert('RGB')
 
-    # Resize image to max_size while preserving aspect ratio
+    # Resize image to max_size while preserving aspect ratio (always resize to max_size)
     original_width, original_height = img.size
-    if original_width > max_size or original_height > max_size:
-        if original_width > original_height:
-            new_width = max_size
-            new_height = int(original_height * (max_size / original_width))
-        else:
-            new_height = max_size
-            new_width = int(original_width * (max_size / original_height))
+    if original_width > original_height:
+        new_width = max_size
+        new_height = int(original_height * (max_size / original_width))
+    else:
+        new_height = max_size
+        new_width = int(original_width * (max_size / original_height))
+
+    # Always resize to ensure consistent output
+    if (new_width, new_height) != (original_width, original_height):
         img = img.resize((new_width, new_height), Image.LANCZOS)
         logger.info(f"Resized image from {original_width}x{original_height} to {new_width}x{new_height}")
+    else:
+        logger.info(f"Image already at target size: {original_width}x{original_height}")
 
     # Convert to base64
     buffer = io.BytesIO()
