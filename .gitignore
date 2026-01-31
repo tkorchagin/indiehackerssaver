@@ -34,6 +34,10 @@ temp/
 photo_*.png
 test_*.py
 test_*.png
+backgrounds/*.png
+backgrounds/*.jpg
+backgrounds/*.jpeg
+!backgrounds/README.md
 
 # Logs
 *.log

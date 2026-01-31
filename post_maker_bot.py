@@ -20,6 +20,7 @@ from apscheduler.triggers.cron import CronTrigger
 import pytz
 from html2image import Html2Image
 import base64
+from mockup_config import MAX_IMAGE_SIZE, MOCKUP_PADDING, BACKGROUND_IMAGE
 
 # Fun status messages while processing
 STATUS_MESSAGES = [
@@ -704,8 +705,16 @@ def read_stories_from_excel(file_path):
 
     return stories
 
-def screenshot_mockup(input_path, output_path):
-    """Transform screenshot into beautiful mockup with gradient background and macOS window."""
+def screenshot_mockup(input_path, output_path, max_size=1024, padding=80, background_image=None):
+    """Transform screenshot into beautiful mockup with gradient background and macOS window.
+
+    Args:
+        input_path: Path to input image
+        output_path: Path to save output
+        max_size: Maximum size for the longest side of the image (default: 1024)
+        padding: Padding around the image in pixels (default: 80)
+        background_image: Optional path to custom background image (if None, uses gradient)
+    """
     from PIL import Image
     import io
 
@@ -723,10 +732,40 @@ def screenshot_mockup(input_path, output_path):
     elif img.mode != 'RGB':
         img = img.convert('RGB')
 
+    # Resize image to max_size while preserving aspect ratio
+    original_width, original_height = img.size
+    if original_width > max_size or original_height > max_size:
+        if original_width > original_height:
+            new_width = max_size
+            new_height = int(original_height * (max_size / original_width))
+        else:
+            new_height = max_size
+            new_width = int(original_width * (max_size / original_height))
+        img = img.resize((new_width, new_height), Image.LANCZOS)
+        logger.info(f"Resized image from {original_width}x{original_height} to {new_width}x{new_height}")
+
     # Convert to base64
     buffer = io.BytesIO()
     img.save(buffer, format='PNG')
     img_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+
+    # Get image dimensions for proper sizing
+    img_width, img_height = img.size
+
+    # Prepare background style
+    if background_image and Path(background_image).exists():
+        # Load custom background and convert to base64
+        bg_img = Image.open(background_image)
+        if bg_img.mode != 'RGB':
+            bg_img = bg_img.convert('RGB')
+        bg_buffer = io.BytesIO()
+        bg_img.save(bg_buffer, format='PNG')
+        bg_base64 = base64.b64encode(bg_buffer.getvalue()).decode('utf-8')
+        background_style = f"background-image: url('data:image/png;base64,{bg_base64}'); background-size: cover; background-position: center;"
+        logger.info(f"Using custom background: {background_image}")
+    else:
+        # Use default gradient
+        background_style = "background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);"
 
     html = f"""
     <!DOCTYPE html>
@@ -741,7 +780,7 @@ def screenshot_mockup(input_path, output_path):
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                {background_style}
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
             }}
             .window {{
@@ -767,9 +806,13 @@ def screenshot_mockup(input_path, output_path):
             .dot.red {{ background: #ff5f57; }}
             .dot.yellow {{ background: #febc2e; }}
             .dot.green {{ background: #28c840; }}
+            .content {{
+                padding: 0 {padding}px {padding}px {padding}px;
+            }}
             img {{
                 display: block;
-                max-width: 1100px;
+                width: {img_width}px;
+                height: {img_height}px;
                 border-radius: 0 0 18px 18px;
             }}
         </style>
@@ -781,7 +824,9 @@ def screenshot_mockup(input_path, output_path):
                 <span class="dot yellow"></span>
                 <span class="dot green"></span>
             </div>
-            <img src="data:image/png;base64,{img_base64}" alt="Screenshot">
+            <div class="content">
+                <img src="data:image/png;base64,{img_base64}" alt="Screenshot">
+            </div>
         </div>
     </body>
     </html>
@@ -795,11 +840,15 @@ def screenshot_mockup(input_path, output_path):
     temp_dir = Path("photos/temp")
     temp_dir.mkdir(parents=True, exist_ok=True)
 
+    # Calculate canvas size based on image + padding + window chrome
+    canvas_width = img_width + (padding * 2) + 100  # Extra for window borders
+    canvas_height = img_height + padding + 100  # Top padding for dots + bottom padding
+
     # Create Html2Image with flags for running as root
     hti = Html2Image(
         output_path=str(output_dir),
         temp_path=str(temp_dir),  # Use photos/temp for temporary files
-        size=(1600, 1000),
+        size=(canvas_width, canvas_height),
         browser='chromium',
         browser_executable='/usr/bin/chromium-browser',
         custom_flags=[
@@ -810,7 +859,7 @@ def screenshot_mockup(input_path, output_path):
         ]
     )
     hti.screenshot(html_str=html, save_as=output_filename)
-    logger.info(f"Screenshot mockup created: {output_path}")
+    logger.info(f"Screenshot mockup created: {output_path} (size: {canvas_width}x{canvas_height})")
 
 async def fetch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -935,7 +984,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Apply mockup in thread to not block
         await status_message.edit_text("✨ Применяю эффект...")
-        await asyncio.to_thread(screenshot_mockup, str(input_path), str(output_path))
+        await asyncio.to_thread(
+            screenshot_mockup,
+            str(input_path),
+            str(output_path),
+            max_size=MAX_IMAGE_SIZE,
+            padding=MOCKUP_PADDING,
+            background_image=BACKGROUND_IMAGE
+        )
 
         # Send back the processed photo
         await status_message.edit_text("📤 Отправляю результат...")
