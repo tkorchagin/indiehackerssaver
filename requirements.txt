@@ -9,3 +9,5 @@ google-generativeai
 feedparser
 apscheduler
 pytz
+html2image
+Pillow

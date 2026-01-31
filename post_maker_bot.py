@@ -18,6 +18,8 @@ from openpyxl import load_workbook
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
+from html2image import Html2Image
+import base64
 
 # Fun status messages while processing
 STATUS_MESSAGES = [
@@ -702,6 +704,114 @@ def read_stories_from_excel(file_path):
 
     return stories
 
+def screenshot_mockup(input_path, output_path):
+    """Transform screenshot into beautiful mockup with gradient background and macOS window."""
+    from PIL import Image
+    import io
+
+    # Load image and convert to base64 PNG
+    img = Image.open(input_path)
+
+    # Convert to RGB if needed
+    if img.mode in ('RGBA', 'LA'):
+        background = Image.new('RGB', img.size, 'white')
+        if img.mode == 'RGBA':
+            background.paste(img, mask=img.split()[3])
+        else:
+            background.paste(img, mask=img.split()[1])
+        img = background
+    elif img.mode != 'RGB':
+        img = img.convert('RGB')
+
+    # Convert to base64
+    buffer = io.BytesIO()
+    img.save(buffer, format='PNG')
+    img_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <style>
+            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+            body {{
+                width: 100vw;
+                height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            }}
+            .window {{
+                background: white;
+                border-radius: 18px;
+                box-shadow: 0 40px 120px rgba(0,0,0,0.35);
+                overflow: hidden;
+                padding-top: 32px;
+                position: relative;
+            }}
+            .dots {{
+                position: absolute;
+                top: 10px;
+                left: 14px;
+                display: flex;
+                gap: 8px;
+            }}
+            .dot {{
+                width: 12px;
+                height: 12px;
+                border-radius: 50%;
+            }}
+            .dot.red {{ background: #ff5f57; }}
+            .dot.yellow {{ background: #febc2e; }}
+            .dot.green {{ background: #28c840; }}
+            img {{
+                display: block;
+                max-width: 1100px;
+                border-radius: 0 0 18px 18px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="window">
+            <div class="dots">
+                <span class="dot red"></span>
+                <span class="dot yellow"></span>
+                <span class="dot green"></span>
+            </div>
+            <img src="data:image/png;base64,{img_base64}" alt="Screenshot">
+        </div>
+    </body>
+    </html>
+    """
+
+    # Get output directory and filename
+    output_dir = Path(output_path).parent
+    output_filename = Path(output_path).name
+
+    # Create temp directory for html2image
+    temp_dir = Path("photos/temp")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create Html2Image with flags for running as root
+    hti = Html2Image(
+        output_path=str(output_dir),
+        temp_path=str(temp_dir),  # Use photos/temp for temporary files
+        size=(1600, 1000),
+        browser='chromium',
+        browser_executable='/usr/bin/chromium-browser',
+        custom_flags=[
+            '--no-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--disable-software-rasterizer'
+        ]
+    )
+    hti.screenshot(html_str=html, save_as=output_filename)
+    logger.info(f"Screenshot mockup created: {output_path}")
+
 async def fetch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = str(user.id)
@@ -785,6 +895,64 @@ async def fetch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error in fetch_command: {e}", exc_info=True)
         await status_message.edit_text(f"❌ Неизвестная ошибка: {str(e)}")
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle photo messages - download, apply mockup, and send back."""
+    user = update.effective_user
+    user_id = str(user.id)
+
+    logger.info(f"Received photo from {user.username} ({user_id})")
+
+    # Filter by Admin ID if set
+    if ADMIN_ID and user_id != str(ADMIN_ID):
+        logger.warning(f"Unauthorized photo from {user_id}")
+        return
+
+    status_message = await update.message.reply_text("🎨 Обрабатываю фото...")
+
+    try:
+        # Get the largest photo size
+        photo = update.message.photo[-1]
+        photo_file = await photo.get_file()
+
+        # Create photos directory structure
+        photos_base = Path("photos")
+        photos_input = photos_base / "input"
+        photos_output = photos_base / "output"
+
+        # Create all directories
+        for dir_path in [photos_input, photos_output]:
+            dir_path.mkdir(parents=True, exist_ok=True)
+
+        # Save in photos/input and photos/output
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        input_path = photos_input / f"{timestamp}.png"
+        output_path = photos_output / f"{timestamp}.png"
+
+        await photo_file.download_to_drive(input_path)
+        logger.info(f"Downloaded photo to {input_path}")
+
+        # Apply mockup in thread to not block
+        await status_message.edit_text("✨ Применяю эффект...")
+        await asyncio.to_thread(screenshot_mockup, str(input_path), str(output_path))
+
+        # Send back the processed photo
+        await status_message.edit_text("📤 Отправляю результат...")
+        with open(output_path, "rb") as f:
+            await update.message.reply_photo(
+                photo=f,
+                caption="✅ Готово! Красивый мокап с градиентом и macOS-окном 🎨"
+            )
+
+        # Delete status message
+        await status_message.delete()
+
+        logger.info(f"Photo processing completed: {output_path}")
+
+    except Exception as e:
+        logger.error(f"Error in handle_photo: {e}", exc_info=True)
+        await status_message.edit_text(f"❌ Ошибка при обработке фото: {str(e)[:200]}")
 
 async def random_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Fetch a random article from Indie Hackers or TechCrunch and generate a post."""
@@ -1354,6 +1522,7 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("techcrunch", techcrunch_command))
     app.add_handler(CommandHandler("random", random_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
     logger.info(f"Bot is starting... (Admin: {ADMIN_ID if ADMIN_ID else 'None'})")

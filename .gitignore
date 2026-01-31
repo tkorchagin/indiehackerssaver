@@ -29,6 +29,11 @@ Thumbs.db
 debug/
 debug.html
 output/
+photos/
+temp/
+photo_*.png
+test_*.py
+test_*.png
 
 # Logs
 *.log
