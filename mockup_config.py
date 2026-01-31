@@ -8,7 +8,7 @@ MOCKUP_PADDING = 80  # Default: 80px
 
 # Background image (optional)
 # Set to None to use default gradient, or provide path to custom background
-BACKGROUND_IMAGE = None  # Example: "backgrounds/gradient1.png"
+BACKGROUND_IMAGE = "backgrounds/photo_2026-01-31 11.37.23.jpeg"  # Your custom background
 
 # You can create different background images and switch between them
 # Examples:

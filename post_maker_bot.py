@@ -781,53 +781,19 @@ def screenshot_mockup(input_path, output_path, max_size=1024, padding=80, backgr
                 align-items: center;
                 justify-content: center;
                 {background_style}
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            }}
-            .window {{
-                background: white;
-                border-radius: 18px;
-                box-shadow: 0 40px 120px rgba(0,0,0,0.35);
-                overflow: hidden;
-                padding-top: 32px;
-                position: relative;
-            }}
-            .dots {{
-                position: absolute;
-                top: 10px;
-                left: 14px;
-                display: flex;
-                gap: 8px;
-            }}
-            .dot {{
-                width: 12px;
-                height: 12px;
-                border-radius: 50%;
-            }}
-            .dot.red {{ background: #ff5f57; }}
-            .dot.yellow {{ background: #febc2e; }}
-            .dot.green {{ background: #28c840; }}
-            .content {{
-                padding: 0 {padding}px {padding}px {padding}px;
+                padding: {padding}px;
             }}
             img {{
                 display: block;
                 width: {img_width}px;
                 height: {img_height}px;
-                border-radius: 0 0 18px 18px;
+                border-radius: 12px;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
             }}
         </style>
     </head>
     <body>
-        <div class="window">
-            <div class="dots">
-                <span class="dot red"></span>
-                <span class="dot yellow"></span>
-                <span class="dot green"></span>
-            </div>
-            <div class="content">
-                <img src="data:image/png;base64,{img_base64}" alt="Screenshot">
-            </div>
-        </div>
+        <img src="data:image/png;base64,{img_base64}" alt="Screenshot">
     </body>
     </html>
     """
@@ -840,9 +806,9 @@ def screenshot_mockup(input_path, output_path, max_size=1024, padding=80, backgr
     temp_dir = Path("photos/temp")
     temp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Calculate canvas size based on image + padding + window chrome
-    canvas_width = img_width + (padding * 2) + 100  # Extra for window borders
-    canvas_height = img_height + padding + 100  # Top padding for dots + bottom padding
+    # Calculate canvas size based on image + padding
+    canvas_width = img_width + (padding * 2)
+    canvas_height = img_height + (padding * 2)
 
     # Create Html2Image with flags for running as root
     hti = Html2Image(
